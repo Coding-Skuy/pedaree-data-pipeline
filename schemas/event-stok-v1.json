@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PantryStockEvent",
+  "description": "Event stok Pedaree versi 1 untuk topik pedaree.stok.v1",
+  "type": "object",
+  "required": ["event", "item", "sisa", "satuan", "kedaluwarsa"],
+  "properties": {
+    "event": {"type": "string", "enum": ["stok.menipis", "stok.habis", "kedaluwarsa.dekat"]},
+    "item": {"type": "string"},
+    "sisa": {"type": "number"},
+    "satuan": {"type": "string"},
+    "kedaluwarsa": {"type": "string", "format": "date"},
+    "recipe_id": {"type": ["string", "null"], "description": "Rujukan resep milik Pawonee"}
+  }
+}
