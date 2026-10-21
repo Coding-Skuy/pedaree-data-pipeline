@@ -1,36 +1,76 @@
-"""Pekerja sinyal: event stok Pedaree -> sinyal permintaan TitipO."""
-from datetime import date
+"""Pekerja sinyal: sinyal stok Pedaree -> dedup 24 jam -> TitipO (anjuran saja).
 
-from pydantic import BaseModel
+Masukan CLI: JSON Lines `SinyalStok` di stdin (`python -m src.pekerja_sinyal < sinyal.jsonl`).
+"""
+from __future__ import annotations
 
+import sys
+from datetime import datetime, timezone
+from enum import Enum
 
-class EventStok(BaseModel):
-    event: str
-    item: str
-    sisa: float
-    satuan: str
-    kedaluwarsa: date
-    recipe_id: str | None = None
-
-
-class SinyalPermintaan(BaseModel):
-    item: str
-    alasan: str
-    recipe_id: str | None = None
+from src.dedup import DedupProdusen
+from src.event_analitik import Penerbit, StatusKirim, sinyal_titipo
+from src.klien_titipo import HasilKirim, KlienTitipo, muat_konfigurasi
+from src.skema import SinyalStok
 
 
-BATAS_MENIPIS_ML = 250.0
-HARI_SEGERA = 3
+class HasilProses(str, Enum):
+    DICATAT = "dicatat"
+    DUPLIKAT_KONSUMEN = "duplikat_konsumen"
+    DITAHAN_DEDUP = "ditahan_dedup"
+    GAGAL_DLQ = "gagal_dlq"
 
 
-def ubah_jadi_sinyal(event: EventStok, hari_ini: date) -> SinyalPermintaan | None:
-    sisa_hari = (event.kedaluwarsa - hari_ini).days
-    if event.sisa <= 0:
-        return SinyalPermintaan(item=event.item, alasan="habis", recipe_id=event.recipe_id)
-    if event.sisa < BATAS_MENIPIS_ML:
-        return SinyalPermintaan(item=event.item, alasan="menipis", recipe_id=event.recipe_id)
-    if sisa_hari <= HARI_SEGERA:
-        return SinyalPermintaan(
-            item=event.item, alasan="kedaluwarsa-dekat", recipe_id=event.recipe_id
+def saring_sinyal(
+    sinyal: SinyalStok, dedup: DedupProdusen, sekarang: datetime
+) -> SinyalStok | None:
+    """Kembalikan sinyal bila lolos dedup 24 jam, selain itu None. Tidak mencatat."""
+    return sinyal if dedup.boleh_kirim(sinyal, sekarang) else None
+
+
+_STATUS_KIRIM = {
+    HasilKirim.DICATAT: StatusKirim.DICATAT,
+    HasilKirim.DUPLIKAT: StatusKirim.DUPLIKAT,
+    HasilKirim.GAGAL_DLQ: StatusKirim.GAGAL,
+}
+
+
+def proses_sinyal(
+    sinyal: SinyalStok,
+    dedup: DedupProdusen,
+    klien: KlienTitipo,
+    sekarang: datetime,
+    penerbit: Penerbit | None = None,
+) -> HasilProses:
+    """Dedup, kirim, lalu catat dedup hanya bila TitipO menerima (201/200).
+
+    Bila `penerbit` diberikan, event analitik `sinyal_titipo` diterbitkan untuk setiap
+    percobaan kirim (bukan untuk sinyal yang ditahan dedup).
+    """
+    if saring_sinyal(sinyal, dedup, sekarang) is None:
+        return HasilProses.DITAHAN_DEDUP
+    hasil = klien.kirim(sinyal)
+    if penerbit is not None:
+        penerbit.terbitkan(
+            sinyal_titipo(sinyal.item_id, sinyal.jenis, _STATUS_KIRIM[hasil], sekarang)
         )
-    return None
+    if hasil is HasilKirim.GAGAL_DLQ:
+        return HasilProses.GAGAL_DLQ
+    dedup.catat(sinyal, sekarang)
+    return HasilProses.DICATAT if hasil is HasilKirim.DICATAT else HasilProses.DUPLIKAT_KONSUMEN
+
+
+def main() -> int:
+    klien = KlienTitipo.dari_konfigurasi(muat_konfigurasi())
+    dedup = DedupProdusen()
+    for baris in sys.stdin:
+        if not baris.strip():
+            continue
+        sinyal = SinyalStok.model_validate_json(baris)
+        hasil = proses_sinyal(sinyal, dedup, klien, datetime.now(timezone.utc))
+        print(f"{sinyal.item_id} {sinyal.jenis.value} {hasil.value}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
